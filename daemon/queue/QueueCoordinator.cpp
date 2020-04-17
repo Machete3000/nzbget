@@ -22,6 +22,7 @@
 #include "nzbget.h"
 #include "QueueCoordinator.h"
 #include "Options.h"
+#include "WorkState.h"
 #include "ServerPool.h"
 #include "ArticleDownloader.h"
 #include "ArticleWriter.h"
@@ -71,6 +72,9 @@ void QueueCoordinator::CoordinatorDownloadQueue::Save()
 
 	m_wantSave = false;
 	m_historyChanged = false;
+
+	// queue has changed, time to wake up if in standby
+	m_owner->WakeUp();
 }
 
 void QueueCoordinator::CoordinatorDownloadQueue::SaveChanged()
@@ -87,6 +91,7 @@ QueueCoordinator::QueueCoordinator()
 	debug("Creating QueueCoordinator");
 
 	CoordinatorDownloadQueue::Init(&m_downloadQueue);
+	g_WorkState->Attach(this);
 }
 
 QueueCoordinator::~QueueCoordinator()
@@ -188,6 +193,7 @@ void QueueCoordinator::Run()
 	bool articeDownloadsRunning = false;
 	time_t lastReset = 0;
 	g_StatMeter->IntervalCheck();
+	int waitInterval = 100;
 
 	while (!IsStopped())
 	{
@@ -208,7 +214,7 @@ void QueueCoordinator::Run()
 				downloadsChecked = true;
 				m_hasMoreJobs = hasMoreArticles || articeDownloadsRunning;
 				if (hasMoreArticles && !IsStopped() && (int)m_activeDownloads.size() < m_downloadsLimit &&
-					(!g_Options->GetTempPauseDownload() || fileInfo->GetExtraPriority()))
+					(!g_WorkState->GetTempPauseDownload() || fileInfo->GetExtraPriority()))
 				{
 					StartArticleDownload(fileInfo, articleInfo, connection);
 					articeDownloadsRunning = true;
@@ -236,6 +242,7 @@ void QueueCoordinator::Run()
 		if (standBy != wasStandBy)
 		{
 			g_StatMeter->EnterLeaveStandBy(standBy);
+			g_WorkState->SetDownloading(!standBy);
 			wasStandBy = standBy;
 			if (standBy)
 			{
@@ -244,18 +251,23 @@ void QueueCoordinator::Run()
 		}
 
 		// sleep longer in StandBy
-		int sleepInterval = downloadStarted ? 0 : standBy ? 100 : 5;
-		usleep(sleepInterval * 1000);
-
-		if (!standBy)
+		if (standBy)
 		{
+			Guard guard(m_waitMutex);
+			// sleeping max. 2 seconds; can't sleep much longer because we can't rely on
+			// notifications from 'WorkState' and we also have periodical work to do here
+			waitInterval = std::min(waitInterval * 2, 2000);
+			m_waitCond.WaitFor(m_waitMutex, waitInterval, [&]{ return m_hasMoreJobs || IsStopped(); });
+		}
+		else
+		{
+			int sleepInterval = downloadStarted ? 0 : 5;
+			Util::Sleep(sleepInterval);
 			g_StatMeter->AddSpeedReading(0);
+			waitInterval = 100;
 		}
 
-		Util::SetStandByMode(standBy);
-
-		time_t currentTime = Util::CurrentTime();
-		if (lastReset != currentTime)
+		if (lastReset != Util::CurrentTime())
 		{
 			// this code should not be called too often, once per second is OK
 			g_ServerPool->CloseUnusedConnections();
@@ -267,7 +279,8 @@ void QueueCoordinator::Run()
 			g_StatMeter->IntervalCheck();
 			g_Log->IntervalCheck();
 			AdjustDownloadsLimit();
-			lastReset = currentTime;
+			Util::SetStandByMode(standBy);
+			lastReset = Util::CurrentTime();
 		}
 	}
 
@@ -277,6 +290,15 @@ void QueueCoordinator::Run()
 	SaveAllFileState();
 
 	debug("Exiting QueueCoordinator-loop");
+}
+
+void QueueCoordinator::WakeUp()
+{
+	debug("Waking up QueueCoordinator");
+	// Resume Run()
+	Guard guard(m_waitMutex);
+	m_hasMoreJobs = true;
+	m_waitCond.NotifyAll();
 }
 
 void QueueCoordinator::WaitJobs()
@@ -293,7 +315,7 @@ void QueueCoordinator::WaitJobs()
 				break;
 			}
 		}
-		usleep(100 * 1000);
+		Util::Sleep(100);
 		ResetHangingDownloads();
 	}
 
@@ -465,12 +487,18 @@ void QueueCoordinator::Stop()
 	Thread::Stop();
 
 	debug("Stopping ArticleDownloads");
-	GuardedDownloadQueue guard = DownloadQueue::Guard();
-	for (ArticleDownloader* articleDownloader : m_activeDownloads)
 	{
-		articleDownloader->Stop();
+		GuardedDownloadQueue guard = DownloadQueue::Guard();
+		for (ArticleDownloader* articleDownloader : m_activeDownloads)
+		{
+			articleDownloader->Stop();
+		}
 	}
 	debug("ArticleDownloads are notified");
+
+	// Resume Run() to exit it
+	Guard guard(m_waitMutex);
+	m_waitCond.NotifyAll();
 }
 
 /*
@@ -505,7 +533,7 @@ bool QueueCoordinator::GetNextArticle(DownloadQueue* downloadQueue, FileInfo* &f
 			bool nzbPaused = nzbInfo->GetFileList()->size() - nzbInfo->GetPausedFileCount() <= 0;
 
 			if ((!fileInfo || nzbHigherPriority) && !nzbPaused &&
-				(!(g_Options->GetPauseDownload() || g_Options->GetQuotaReached()) || nzbInfo->GetForcePriority()))
+				(!(g_WorkState->GetPauseDownload() || g_WorkState->GetQuotaReached()) || nzbInfo->GetForcePriority()))
 			{
 				for (FileInfo* fileInfo1 : nzbInfo->GetFileList())
 				{
@@ -629,11 +657,18 @@ void QueueCoordinator::StartArticleDownload(FileInfo* fileInfo, ArticleInfo* art
 	articleDownloader->Start();
 }
 
-void QueueCoordinator::Update(Subject* Caller, void* Aspect)
+void QueueCoordinator::Update(Subject* caller, void* aspect)
 {
+	if (caller == g_WorkState)
+	{
+		debug("Notification from WorkState received");
+		WakeUp();
+		return;
+	}
+
 	debug("Notification from ArticleDownloader received");
 
-	ArticleDownloader* articleDownloader = (ArticleDownloader*)Caller;
+	ArticleDownloader* articleDownloader = (ArticleDownloader*)caller;
 	if ((articleDownloader->GetStatus() == ArticleDownloader::adFinished) ||
 		(articleDownloader->GetStatus() == ArticleDownloader::adFailed) ||
 		(articleDownloader->GetStatus() == ArticleDownloader::adRetry))
@@ -787,7 +822,7 @@ void QueueCoordinator::DeleteFileInfo(DownloadQueue* downloadQueue, FileInfo* fi
 {
 	while (g_ArticleCache->FileBusy(fileInfo))
 	{
-		usleep(5*1000);
+		Util::Sleep(5);
 	}
 
 	NzbInfo* nzbInfo = fileInfo->GetNzbInfo();
@@ -1001,9 +1036,9 @@ void QueueCoordinator::LogDebugInfo()
 	downloadQueue->CalcRemainingSize(&remaining, &remainingForced);
 	info("     Remaining: %.1f MB, Forced: %.1f MB", remaining / 1024.0 / 1024.0, remainingForced / 1024.0 / 1024.0);
 	info("     Download: %s, Post-process: %s, Scan: %s",
-		 (g_Options->GetPauseDownload() ? "paused" : g_Options->GetTempPauseDownload() ? "temp-paused" : "active"),
-		 (g_Options->GetPausePostProcess() ? "paused" : "active"),
-		 (g_Options->GetPauseScan() ? "paused" : "active"));
+		 (g_WorkState->GetPauseDownload() ? "paused" : g_WorkState->GetTempPauseDownload() ? "temp-paused" : "active"),
+		 (g_WorkState->GetPausePostProcess() ? "paused" : "active"),
+		 (g_WorkState->GetPauseScan() ? "paused" : "active"));
 
 	info("   ---------- QueueCoordinator");
 	info("    Active Downloads: %i, Limit: %i", (int)m_activeDownloads.size(), m_downloadsLimit);

@@ -41,7 +41,7 @@ public:
 	virtual ~QueueCoordinator();
 	virtual void Run();
 	virtual void Stop();
-	void Update(Subject* Caller, void* Aspect);
+	void Update(Subject* caller, void* aspect);
 
 	// editing queue
 	NzbInfo* AddNzbFileToQueue(std::unique_ptr<NzbInfo> nzbInfo, NzbInfo* urlInfo, bool addFirst);
@@ -95,6 +95,8 @@ private:
 	bool m_hasMoreJobs = true;
 	int m_downloadsLimit;
 	int m_serverConfigGeneration = 0;
+	Mutex m_waitMutex;
+	ConditionVar m_waitCond;
 
 	bool GetNextArticle(DownloadQueue* downloadQueue, FileInfo* &fileInfo, ArticleInfo* &articleInfo);
 	bool GetNextFirstArticle(NzbInfo* nzbInfo, FileInfo* &fileInfo, ArticleInfo* &articleInfo);
@@ -115,6 +117,7 @@ private:
 	void LoadPartialState(FileInfo* fileInfo);
 	void SaveAllFileState();
 	void WaitJobs();
+	void WakeUp();
 };
 
 extern QueueCoordinator* g_QueueCoordinator;
